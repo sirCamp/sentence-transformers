@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class CrossEncoder():
     def __init__(self, model_name:str, num_labels:int = None, max_length:int = None, device:str = None, tokenizer_args:Dict = {},
-                  automodel_args:Dict = {}, default_activation_function = None):
+                  automodel_args:Dict = {}, default_activation_function = None, tokenizer = None, tokenization_args = None, max_position_embeddings:int = None, n_gpus:int = 1):
         """
         A CrossEncoder takes exactly two sentences / texts as input and either predicts
         a score or label for this sentence pair. It can for example predict the similarity of the sentence pair
@@ -36,7 +36,11 @@ class CrossEncoder():
         :param default_activation_function: Callable (like nn.Sigmoid) about the default activation function that should be used on-top of model.predict(). If None. nn.Sigmoid() will be used if num_labels=1, else nn.Identity()
         """
 
+        self.tokenization_args = tokenization_args
         self.config = AutoConfig.from_pretrained(model_name)
+        self.n_gpus = n_gpus
+        if max_position_embeddings is not None:
+            self.config.max_position_embeddings = max_position_embeddings
         classifier_trained = True
         if self.config.architectures is not None:
             classifier_trained = any([arch.endswith('ForSequenceClassification') for arch in self.config.architectures])
@@ -48,7 +52,10 @@ class CrossEncoder():
             self.config.num_labels = num_labels
 
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name, config=self.config, **automodel_args)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_args)
+        if tokenizer == None:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_args)
+        else:
+            self.tokenizer = tokenizer.from_pretrained(model_name, **tokenizer_args)
         self.max_length = max_length
 
         if device is None:
@@ -78,7 +85,10 @@ class CrossEncoder():
 
             labels.append(example.label)
 
-        tokenized = self.tokenizer(*texts, padding=True, truncation='longest_first', return_tensors="pt", max_length=self.max_length)
+        if self.tokenization_args is None:
+            tokenized = self.tokenizer(*texts, padding=True, truncation='longest_first', return_tensors="pt", max_length=self.max_length)
+        else:
+            tokenized = self.tokenizer(*texts, padding=True, return_tensors="pt", max_length=self.max_length, **self.tokenization_args)
         labels = torch.tensor(labels, dtype=torch.float if self.config.num_labels == 1 else torch.long).to(self._target_device)
 
         for name in tokenized:
@@ -117,7 +127,7 @@ class CrossEncoder():
             max_grad_norm: float = 1,
             use_amp: bool = False,
             callback: Callable[[float, int, int], None] = None,
-            show_progress_bar: bool = True
+            show_progress_bar: bool = True,
             ):
         """
         Train the model with the given training objective
@@ -146,10 +156,12 @@ class CrossEncoder():
         :param show_progress_bar: If True, output a tqdm progress bar
         """
         train_dataloader.collate_fn = self.smart_batching_collate
-
         if use_amp:
             from torch.cuda.amp import autocast
             scaler = torch.cuda.amp.GradScaler()
+
+        if self.n_gpus > 1:
+            self.model = torch.nn.DataParallel(self.model)
 
         self.model.to(self._target_device)
 
@@ -160,7 +172,10 @@ class CrossEncoder():
         num_train_steps = int(len(train_dataloader) * epochs)
 
         # Prepare optimizers
-        param_optimizer = list(self.model.named_parameters())
+        if self.n_gpus <=1:
+            param_optimizer = list(self.model.named_parameters())
+        else:
+            param_optimizer = list(self.model.module.named_parameters())
 
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
@@ -178,6 +193,8 @@ class CrossEncoder():
 
 
         skip_scheduler = False
+
+
         for epoch in trange(epochs, desc="Epoch", disable=not show_progress_bar):
             training_steps = 0
             self.model.zero_grad()
@@ -190,7 +207,11 @@ class CrossEncoder():
                         logits = activation_fct(model_predictions.logits)
                         if self.config.num_labels == 1:
                             logits = logits.view(-1)
+
                         loss_value = loss_fct(logits, labels)
+                        if self.n_gpus > 1:
+                            loss_value = loss_value.mean()
+
 
                     scale_before_step = scaler.get_scale()
                     scaler.scale(loss_value).backward()
@@ -206,6 +227,8 @@ class CrossEncoder():
                     if self.config.num_labels == 1:
                         logits = logits.view(-1)
                     loss_value = loss_fct(logits, labels)
+                    if self.n_gpus > 1:
+                        loss_value = loss_value.mean()
                     loss_value.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                     optimizer.step()
@@ -312,7 +335,10 @@ class CrossEncoder():
             return
 
         logger.info("Save model to {}".format(path))
-        self.model.save_pretrained(path)
+        if self.n_gpus <=1:
+            self.model.save_pretrained(path)
+        else:
+            self.model.module.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
 
     def save_pretrained(self, path):
